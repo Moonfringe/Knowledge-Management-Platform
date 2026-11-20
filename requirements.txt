@@ -1,0 +1,28 @@
+# 个人知识管理平台 —— 运行依赖
+# 安装：pip install -r requirements.txt
+# Python 3.13 / MySQL 8.0
+
+# ---- Web 框架 ----
+fastapi==0.163.1
+# [standard] 会带上 httptools / watchfiles / websockets，
+# 少了它 uvicorn --reload 用不了（无法监听文件变化）
+uvicorn[standard]==0.54.0
+
+# ---- 数据层 ----
+# 必须写 [asyncio]：裸 sqlalchemy 不装 greenlet，
+# create_async_engine 会直接 ImportError
+sqlalchemy[asyncio]==2.1.9
+# MySQL 异步驱动
+aiomysql==0.3.2
+
+# ---- 迁移 ----
+alembic==1.20.1
+
+# ---- 配置与校验 ----
+pydantic==2.14.3
+pydantic-settings==2.16.3
+
+# ---- MySQL 8 认证 ----
+# caching_sha2_password 在非 TLS 连接下需要 RSA 加密，
+# 缺了它会报 RuntimeError: 'cryptography' package is required ...
+cryptography==50.0.2
