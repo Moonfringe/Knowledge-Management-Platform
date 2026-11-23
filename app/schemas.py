@@ -1,9 +1,19 @@
-from pydantic import BaseModel, Field, ConfigDict, field_validator
+from pydantic import BaseModel, Field, ConfigDict, field_validator, AfterValidator
 from typing import Any, Annotated
 
 from datetime import datetime
 
 TagName = Annotated[str, Field(min_length=1, max_length=50)]
+
+
+def _bcrypt_byte_limit(v: str) -> str:
+    """bcrypt 只接受 72 字节以内，中文一个字 3 字节"""
+    if len(v.encode("utf-8")) > 72:
+        raise ValueError("密码过长（UTF-8 编码后不得超过 72 字节）")
+    return v
+
+
+Password = Annotated[str, Field(min_length=8, max_length=72), AfterValidator(_bcrypt_byte_limit)]
 
 
 class NoteCreate(BaseModel):
@@ -61,6 +71,18 @@ class TagOut(BaseModel):
     note_count: int
 
 
-
 class NoteTagsUpdate(BaseModel):
     tags: list[TagName]
+
+
+class UserCreate(BaseModel):
+    username: str = Field(min_length=1, max_length=50)
+    password: Password
+
+
+class UserOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    username: str
+    created_at: datetime

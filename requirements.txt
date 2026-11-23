@@ -26,3 +26,8 @@ pydantic-settings==2.16.3
 # caching_sha2_password 在非 TLS 连接下需要 RSA 加密，
 # 缺了它会报 RuntimeError: 'cryptography' package is required ...
 cryptography==50.0.2
+
+# ---- 密码哈希 ----
+# 直接用 bcrypt.hashpw / checkpw，不经 passlib 包装
+# 注意 5.x 对超过 72 字节的密码直接抛 ValueError（4.x 是静默截断到 72）
+bcrypt==5.0.0
