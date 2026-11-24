@@ -4,7 +4,7 @@
 
 **FastAPI + SQLAlchemy 2.0（异步）+ MySQL 8 + Alembic**，全异步实现。
 
-> 学习项目，按周迭代。当前进度：第 10 周（数据模型 + 接口层完成），第 11 周补充 JWT 鉴权。
+> 学习项目，按周迭代。当前进度：第 11 周完成（数据模型 + 全部 CRUD 接口 + 用户注册/登录 + JWT 鉴权）。
 
 ---
 
@@ -21,6 +21,9 @@
 | Alembic | 1.20 | 数据库迁移（异步 `env.py`） |
 | MySQL | 8.0 | `utf8mb4` / `utf8mb4_0900_ai_ci` |
 | cryptography | 50.0 | MySQL 8 `caching_sha2_password` 认证必需 |
+| bcrypt | 5.0 | 密码哈希，`gensalt(12)` |
+| PyJWT | 2.15 | 签发 / 校验 JWT（包名 `PyJWT`，import 写 `jwt`） |
+| python-multipart | 0.0.34 | `OAuth2PasswordRequestForm` 解析 form 表单必需 |
 
 > `cryptography` 不是可选项。MySQL 8 默认认证方式在非 TLS 连接下需要 RSA 加密，缺少它会报
 > `RuntimeError: 'cryptography' package is required for caching_sha2_password auth methods`。
@@ -59,7 +62,17 @@ pip install -r requirements.txt
 
 ```
 DATABASE_URL=mysql+aiomysql://root:your_password@127.0.0.1:3306/knowledge_management?charset=utf8mb4
+SECRET_KEY=把下面生成的一串贴进来
 ```
+
+`SECRET_KEY` 用于 JWT 签名，**没有默认值，缺失会直接启动失败**（`ValidationError: SECRET_KEY Field required`）。
+生成方式：
+
+```bash
+python -c "import secrets; print(secrets.token_hex(32))"
+```
+
+这串东西换掉后，所有已签发的 token 立刻失效——这是唯一的"强制所有人重新登录"手段。
 
 ### 4. 建表
 
@@ -84,10 +97,13 @@ uvicorn main:app --reload
 
 ## 接口一览
 
-统一前缀无版本号，所有接口的 `user_id` 由服务端注入（当前为固定值，第 11 周替换为 JWT 解析）。
+统一前缀无版本号。除 `/auth/*` 与 `/health` 外，**所有接口都要求 `Authorization: Bearer <token>`**，
+`user_id` 由服务端从 JWT 解析后注入，不接受客户端传参。
 
 | 方法 | 路径 | 说明 | 成功状态码 |
 |---|---|---|---|
+| POST | `/auth/register` | 用户注册，用户名唯一；重名返回 409 | 201 |
+| POST | `/auth/login` | 登录，**form 提交**（`username` / `password`），返回 JWT | 200 |
 | POST | `/notes` | 创建笔记（笔记与标签关联在同一事务内） | 201 |
 | GET | `/notes` | 笔记列表，支持分页 / 关键词 / 标签筛选 | 200 |
 | GET | `/notes/{note_id}` | 笔记详情 | 200 |
@@ -96,6 +112,23 @@ uvicorn main:app --reload
 | DELETE | `/notes/{note_id}` | 删除笔记 | 204 |
 | GET | `/tags` | 标签列表 + 每个标签关联的笔记数 | 200 |
 | GET | `/health` | 健康检查 | 200 |
+
+### 认证怎么用
+
+登录接口收的是 **form**（`application/x-www-form-urlencoded`），不是 JSON：
+
+```bash
+TOKEN=$(curl -s --noproxy "*" -X POST http://127.0.0.1:8000/auth/login \
+  -d "username=alice&password=yourpassword" \
+  | python -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
+
+curl -s --noproxy "*" http://127.0.0.1:8000/notes -H "Authorization: Bearer $TOKEN"
+```
+
+> 用 JSON 打登录接口会得到 **422**，`loc` 指向 `body.username` —— 这是提交格式错了，不是字段名错了。
+
+打开 `/docs` 点右上角 **Authorize** 可以直接用：填用户名密码，Swagger UI 会照着 `tokenUrl`
+自己换 token。能这样是因为 `OAuth2PasswordBearer(tokenUrl="/auth/login")` 把登录地址告诉了文档页。
 
 ### `GET /notes` 查询参数
 
@@ -172,14 +205,18 @@ Knowledge_Management/
 ├── app/
 │   ├── config.py            # pydantic-settings 读取 .env
 │   ├── database.py          # engine / AsyncSessionFactory / Base / get_db
-│   ├── dependencies.py      # get_current_user_id（第 11 周替换为 JWT）
+│   ├── dependencies.py      # OAuth2PasswordBearer + get_current_user_id（解析 JWT）
+│   ├── security.py          # bcrypt 哈希 / JWT 签发与解析（纯工具，不 import fastapi）
 │   ├── schemas.py           # 全部 Pydantic 模型
 │   ├── services.py          # 可复用的业务函数（get_or_create_tags）
 │   ├── models/              # users / notes / tags / note_tags
 │   └── routers/
 │       ├── __init__.py      # api_router 汇总各子路由
+│       ├── auth.py          # 注册 / 登录
 │       ├── notes.py
 │       └── tags.py
+├── scripts/
+│   └── test_api.py          # httpx 接口自测（22 条断言，需先启动服务）
 └── .env                     # 不提交
 ```
 
@@ -189,10 +226,10 @@ Knowledge_Management/
 
 这一节记录的是"为什么这样写"，每条都是权衡后的选择。
 
-### 1. 认证尚未实现，但隔离逻辑已就位
+### 1. user_id 走依赖注入，换鉴权方式时业务接口一行不用改
 
-`app/dependencies.py` 里的 `get_current_user_id()` 当前固定返回 `1`，所有接口通过
-`Depends` 注入它。第 11 周接入 JWT 时，只需改这一个函数的实现，**所有接口的租户隔离逻辑一行都不用动**。
+第 10 周所有接口就通过 `Depends(get_current_user_id)` 拿用户身份，那时函数体是写死的 `return 1`。
+第 11 周接 JWT，只改 `dependencies.py` 里这一个函数的实现，**七个业务接口的代码一个字都没动**。
 
 反过来如果让前端传 `?user_id=5`，等于任何人都能读别人的笔记。这一行是整个服务的安全底座。
 
@@ -275,6 +312,21 @@ Note.tags.any(Tag.name == tag)
 "存在但无权访问"返回 403、"不存在"返回 404，攻击者能靠状态码差异枚举出哪些 `id` 真实存在。
 统一返回 404，外部无法区分。这是安全惯例，不是偷懒。
 
+### 11. 鉴权时不查库确认用户存在
+
+`get_current_user_id()` 只解析 token，不 `db.get(User, user_id)`。代价是已删除用户的 token 在过期前仍能过鉴权，
+但它的请求会全部因为 `Note.user_id == user_id` 过滤不到数据而返回空列表，不会越权。
+
+换来的是每个请求省一次 SELECT——鉴权是**每个请求都要走**的路径，省在这里收益最大。
+若将来需要"封禁即生效"，再引入黑名单或 `token_version` 字段。
+
+### 12. 登录失败不区分"用户不存在"和"密码错误"
+
+两种情况返回完全相同的 401 `{"detail": "用户名或密码错误"}`。分开说就等于送了一个用户名枚举接口。
+
+判断写成 `if not user or not verify_password(...)` 也利用了短路求值：用户不存在时**不会**再跑一次 bcrypt，
+既省掉约 200ms 的哈希开销，也避免响应时间泄露"这个用户名到底存不存在"。
+
 ---
 
 ## 已知局限
@@ -285,15 +337,17 @@ Note.tags.any(Tag.name == tag)
 | `OFFSET` 深分页越翻越慢 | 第 1000 页需扫描前 2 万行 | 换游标分页（`WHERE id < 上一页最后一条 id`） |
 | `DATETIME` 精度为秒 | 同一秒内更新的笔记排序不稳定 | 排序加 `id DESC` 兜底；或字段改 `DATETIME(6)` |
 | 孤儿标签不回收 | 清空标签后 `tags` 表留下零引用记录 | 由 `GET /tags` 暴露 + 定期清理任务 |
-| 无用户认证 | 所有请求以固定用户身份执行 | 第 11 周接入 JWT |
-| 无自动化测试 | 回归靠手工 curl | 补 pytest + httpx 集成测试 |
+| 测试脚本留下固定残留 | `scripts/test_api.py` 每次跑完，`zz_api_user` 账号连同名下 `zz_test` / `FastAPI` 两条零引用标签常驻 `users` / `tags` 表 | 脚本按名字 `get_or_create` 复用已有标签，**ID 不会持续增长**（固定为 27 / 28）；彻底清理需业务层标签回收，不值得为测试数据加 |
+| 测试脚本不是 pytest | 22 条断言靠 `print` 输出，无 fixture、参数化、用例隔离 | 第 12 周后视需要迁移到 pytest |
+| token 签发后无法主动失效 | 退出登录或改密码后，旧 token 在 60 分钟内仍有效 | 加黑名单（存 Redis）或短期 access + refresh token 双 token |
+| 无自动化测试 | 回归靠手工 curl + `scripts/test_api.py` | 补 pytest + httpx 集成测试 |
 
 ---
 
 ## 路线图
 
 - [x] 第 10 周：数据模型、迁移、六个 CRUD 接口 + 标签计数
-- [ ] 第 11 周：用户注册 / 登录、bcrypt 密码哈希、JWT 鉴权，替换 `get_current_user_id`
+- [x] 第 11 周：用户注册 / 登录、bcrypt 密码哈希、JWT 鉴权，替换 `get_current_user_id`
 - [ ] 第 12 周：Dockerfile + docker-compose（MySQL + 应用），注意显式安装 `cryptography`
 - [ ] 第 13 周：Streamlit 前端
 
@@ -308,3 +362,15 @@ Note.tags.any(Tag.name == tag)
 - 一次性脚本结尾要 `await engine.dispose()`，否则 Windows 上会刷
   `RuntimeError: Event loop is closed`（aiomysql 连接对象 GC 时触发）。uvicorn 下不会出现。
 - 异步 ORM 必须设 `expire_on_commit=False`，否则 commit 后再读属性会抛 `MissingGreenlet`。
+- `scripts/test_api.py` 的**退出码约定**：`0` = 22 条全过；`1` = 有用例失败，或服务根本没启动。
+  脚本开头先探 `/health`，连不上直接退出（抓 `httpx.TransportError`，它同时覆盖 `ConnectError` 和超时），
+  所以它可以直接接在 `&&` 链后面或丢进 CI。
+- 验退出码时**别接管道**：`python x.py | tail` 之后 `$?` 取的是 `tail` 的状态，永远是 0。
+  要么先 `> log 2>&1` 再 `echo $?`，要么 `set -o pipefail`。
+- **PyJWT 2.x 校验 `sub` 必须是字符串**：`jwt.encode({"sub": 1})` 能编码成功，但 `decode` 时会抛
+  `InvalidSubjectError`。签发时写 `str(user_id)`，解析时再 `int(payload["sub"])`。
+- `jwt.decode(..., algorithms=[...])` 的列表**不能省**：省掉等于接受 token 自称的任何算法。
+- 所有 decode 失败（过期、签名错、格式错、`sub` 非字符串）都继承 `jwt.InvalidTokenError`，
+  一个 `except` 就能全接住；但要额外带上 `KeyError`（无 `sub`）和 `ValueError`（`sub` 不是数字）。
+- 密码上限是 **72 字节**（不是 72 字符）：bcrypt 5.x 对超长输入直接抛 `ValueError`，不是静默截断。
+  一个汉字占 3 字节，所以 24 个汉字就已经到顶了——校验必须按 `len(v.encode("utf-8"))` 算。
