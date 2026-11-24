@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, ConfigDict, field_validator, AfterValidator
-from typing import Any, Annotated
+from typing import Any, Annotated, Literal
 
 from datetime import datetime
 
@@ -86,3 +86,8 @@ class UserOut(BaseModel):
     id: int
     username: str
     created_at: datetime
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: Literal["bearer"] = "bearer"

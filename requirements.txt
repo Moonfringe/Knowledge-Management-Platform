@@ -31,3 +31,9 @@ cryptography==50.0.2
 # 直接用 bcrypt.hashpw / checkpw，不经 passlib 包装
 # 注意 5.x 对超过 72 字节的密码直接抛 ValueError（4.x 是静默截断到 72）
 bcrypt==5.0.0
+
+# ---- JWT 鉴权 ----
+# 包名是 PyJWT，import 时写 jwt；不要装 python-jose（依赖 ecdsa，有已知漏洞未修）
+pyjwt==2.15.1
+# OAuth2PasswordRequestForm 收 form 请求必需，缺了登录接口 500
+python-multipart==0.0.34
