@@ -1,7 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.dependencies import get_current_user_id
+from app.dependencies import get_current_user_id, get_owned_note
 from app.database import get_db
 from app.schemas import NoteDetail, NoteCreate, NotePage, NoteUpdate, NoteTagsUpdate
 from app.models import Note, Tag
@@ -36,14 +36,7 @@ async def create_note(
 
 
 @router.get("/{note_id}", response_model=NoteDetail)
-async def get_note(
-        note_id: int,
-        user_id: int = Depends(get_current_user_id),
-        db: AsyncSession = Depends(get_db),
-):
-    note = await db.get(Note, note_id)
-    if note is None or note.user_id != user_id:
-        raise HTTPException(status_code=404, detail="笔记不存在")
+async def get_note(note: Note = Depends(get_owned_note)):
     return note
 
 
@@ -79,15 +72,12 @@ async def get_notes(
 @router.patch("/{note_id}", response_model=NoteDetail)
 async def update_note(
         payload: NoteUpdate,
-        note_id: int,
+        note: Note = Depends(get_owned_note),
         user_id: int = Depends(get_current_user_id),
         db: AsyncSession = Depends(get_db),
 ):
     update_data = payload.model_dump(exclude_unset=True, exclude_none=True)
     tag_names = update_data.pop("tags", None)
-    note = await db.get(Note, note_id)
-    if note is None or note.user_id != user_id:
-        raise HTTPException(status_code=404, detail="笔记不存在")
     for k, v in update_data.items():
         setattr(note, k, v)
     if tag_names is not None:
@@ -100,13 +90,10 @@ async def update_note(
 @router.put("/{note_id}/tags", response_model=NoteDetail)
 async def update_tags(
         payload: NoteTagsUpdate,
-        note_id: int,
+        note: Note = Depends(get_owned_note),
         user_id: int = Depends(get_current_user_id),
         db: AsyncSession = Depends(get_db),
 ):
-    note = await db.get(Note, note_id)
-    if note is None or note.user_id != user_id:
-        raise HTTPException(status_code=404, detail="笔记不存在")
     note.tags = await get_or_create_tags(db, user_id, payload.tags)
     note.updated_at = datetime.now()
     await db.commit()
@@ -115,13 +102,9 @@ async def update_tags(
 
 @router.delete("/{note_id}", status_code=204)
 async def delete_note(
-        note_id: int,
-        user_id: int = Depends(get_current_user_id),
+        note: Note = Depends(get_owned_note),
         db: AsyncSession = Depends(get_db),
 ):
-    note = await db.get(Note, note_id)
-    if note is None or note.user_id != user_id:
-        raise HTTPException(status_code=404, detail="笔记不存在")
     await db.delete(note)
     await db.commit()
     return None
