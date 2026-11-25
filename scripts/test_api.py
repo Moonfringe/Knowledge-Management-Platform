@@ -18,9 +18,12 @@ async def main():
     async with httpx.AsyncClient(base_url="http://127.0.0.1:8000", trust_env=False) as client:
         # 先探活，服务没起就别往下跑了
         try:
-            await client.get("/health")
+            r = await client.get("/health")
         except httpx.TransportError as e:
             print(f"服务没起来（{type(e).__name__}）：先在项目根执行 uvicorn main:app --reload")
+            raise SystemExit(1)
+        if r.status_code != 200:
+            print(f"/health 返回 {r.status_code}，服务没正常起来：{r.text[:80]}")
             raise SystemExit(1)
         # ---- 新增：先测鉴权，此时 client 还没 token ----
         r = await client.get("/notes")
