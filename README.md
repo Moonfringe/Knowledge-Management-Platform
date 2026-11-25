@@ -4,7 +4,7 @@
 
 **FastAPI + SQLAlchemy 2.0（异步）+ MySQL 8 + Alembic**，全异步实现。
 
-> 学习项目，按周迭代。当前进度：第 11 周完成（数据模型 + 全部 CRUD 接口 + 用户注册/登录 + JWT 鉴权）。
+> 学习项目，按周迭代。当前进度：第 11 周完成（数据模型 + 全部 CRUD 接口 + 用户注册/登录 + JWT 鉴权 + 统一错误响应）。
 
 ---
 
@@ -171,6 +171,25 @@ curl -s --noproxy "*" http://127.0.0.1:8000/notes -H "Authorization: Bearer $TOK
 
 `note_count` 只统计**未归档**的笔记，与 `GET /notes?tag=xxx` 返回的 `total` 严格一致。
 
+### 错误响应
+
+**成功响应不包信封**，直接返回资源本身；**HTTP 状态码就是契约**。错误侧统一成 `{"detail": "一句话"}`，
+只有字段级校验失败（422）额外带一个 `errors` 数组。
+
+| 场景 | 状态码 | 响应体 |
+|---|---|---|
+| 未知路由 / 方法不对 | 404 / 405 | `{"detail": "资源不存在"}` / `{"detail": "请求方法不允许"}` |
+| 未带 token | 401 | `{"detail": "未认证，请先通过 /auth/login 换取 token"}` + `WWW-Authenticate: Bearer` |
+| 业务错误（自己抛的） | 4xx | `{"detail": "笔记不存在"}`（原样透出，不进映射表） |
+| 字段校验失败 | 422 | `{"detail": "请求参数校验失败", "errors": [{"field": "password", "msg": "..."}]}` |
+| 未捕获异常 | 500 | `{"detail": "服务器内部错误"}`，堆栈只进服务端日志 |
+
+422 的 `field` 是从 `loc` 拼出来的字段路径，嵌套结构用 `.` 连接（`tags.0` 表示 `tags` 数组第 0 项）；
+body 整体不是合法 JSON 时 `field` 为 `"body"`。
+
+`errors` 里**只有 `field` 和 `msg`**——pydantic 原始错误对象里的 `input`（用户提交的原文）和 `ctx`
+（异常的原始对象）一律丢弃。前者会导致密码明文回显，后者不可 JSON 序列化。
+
 ---
 
 ## 数据模型
@@ -197,7 +216,7 @@ users ──1:N──> notes ──┐
 
 ```
 Knowledge_Management/
-├── main.py                  # FastAPI 入口，挂载 api_router + /health
+├── main.py                  # FastAPI 入口，注册异常处理器 + 挂载 api_router + /health
 ├── alembic.ini
 ├── alembic/
 │   ├── env.py               # 异步迁移环境
@@ -205,7 +224,8 @@ Knowledge_Management/
 ├── app/
 │   ├── config.py            # pydantic-settings 读取 .env
 │   ├── database.py          # engine / AsyncSessionFactory / Base / get_db
-│   ├── dependencies.py      # OAuth2PasswordBearer + get_current_user_id（解析 JWT）
+│   ├── dependencies.py      # OAuth2PasswordBearer + get_current_user_id + get_owned_note
+│   ├── exceptions.py        # 三个全局异常处理器 + register_exception_handlers(app)
 │   ├── security.py          # bcrypt 哈希 / JWT 签发与解析（纯工具，不 import fastapi）
 │   ├── schemas.py           # 全部 Pydantic 模型
 │   ├── services.py          # 可复用的业务函数（get_or_create_tags）
@@ -327,6 +347,39 @@ Note.tags.any(Tag.name == tag)
 判断写成 `if not user or not verify_password(...)` 也利用了短路求值：用户不存在时**不会**再跑一次 bcrypt，
 既省掉约 200ms 的哈希开销，也避免响应时间泄露"这个用户名到底存不存在"。
 
+### 13. 成功响应不包 `{code, msg, data}` 信封
+
+国内教程常见的做法是把所有响应包成 `200 + {"code": 0, "message": "success", "data": {...}}`。本项目的取舍是**不做**：
+
+- **HTTP 状态码本身就是统一格式。** 业务异常一律返回 200，等于关掉 `curl -f`、网关重试、监控告警、
+  云平台健康检查这些所有读状态码的东西，上面的「成功状态码」表格也会立刻变成谎话
+- **`response_model` 会废掉。** 包信封要写 `ApiResponse[NoteDetail]` 这类泛型，`/docs` 里每个接口两层套娃，
+  看不到真实字段结构
+- 唯一的收益是"前端只判 `code`"，而前端本来就要处理非 2xx 的响应，省不掉
+
+统一的是**错误侧**，不是成功侧。
+
+### 14. 422 丢弃 `input` 和 `ctx`
+
+只保留 `field` 和 `msg`。两个键各有理由：
+
+- `input` 是用户提交的原文——密码校验失败时它就是密码明文。今天只进响应，一旦第 13 周前端接了
+  Sentry 之类的错误上报，密码就进了第三方日志
+- `ctx` 里装着原始异常对象（`ctx: {"error": ValueError(...)}`）。**`JSONResponse` 不经过 `jsonable_encoder`**，
+  直接塞进 `content` 会让 422 处理器自己炸成 500——正好发生在它最该工作的场景上
+
+顺带解决可读性：前端不用再处理 `loc` 可能是 `["body","tags",0]` 这种带下标的形态。
+
+### 15. 框架英文文案按 `detail` 映射，不按状态码覆盖
+
+`FRAMEWORK_MESSAGES` 的键是文案（`"Not Found"` → `"资源不存在"`），不是状态码。
+
+若按状态码写 `{404: "资源不存在"}`，会把接口自己抛的 `HTTPException(404, detail="笔记不存在")`
+一并抹成笼统的四个字，比英文更糟。按文案查表就能区分"框架抛的"和"业务抛的"——后者不在表里，原样返回。
+
+`"Not authenticated"` 要单独列一条：它是 `OAuth2PasswordBearer` 在 `auto_error=True` 时抛的，
+不是状态码 401 对应的标准 phrase（那个是 `"Unauthorized"`）。
+
 ---
 
 ## 已知局限
@@ -339,15 +392,17 @@ Note.tags.any(Tag.name == tag)
 | 孤儿标签不回收 | 清空标签后 `tags` 表留下零引用记录 | 由 `GET /tags` 暴露 + 定期清理任务 |
 | 测试脚本留下固定残留 | `scripts/test_api.py` 每次跑完，`zz_api_user` 账号连同名下 `zz_test` / `FastAPI` 两条零引用标签常驻 `users` / `tags` 表 | 脚本按名字 `get_or_create` 复用已有标签，**ID 不会持续增长**（固定为 27 / 28）；彻底清理需业务层标签回收，不值得为测试数据加 |
 | 测试脚本不是 pytest | 22 条断言靠 `print` 输出，无 fixture、参数化、用例隔离 | 第 12 周后视需要迁移到 pytest |
+| 跨用户越权没有回归断言 | 脚本只用单一账号跑 happy path，隔离逻辑改坏了照样 22/22（已实测验证过这一点） | 补第二个账号，断言详情/改/删/换标签全 404，列表与搜索结果为空 |
 | token 签发后无法主动失效 | 退出登录或改密码后，旧 token 在 60 分钟内仍有效 | 加黑名单（存 Redis）或短期 access + refresh token 双 token |
-| 无自动化测试 | 回归靠手工 curl + `scripts/test_api.py` | 补 pytest + httpx 集成测试 |
+| 500 的响应体是固定文案 | 客户端看到的信息量为零，定位问题只能翻服务端日志 | 需要时在响应里带 `trace_id`，与日志关联 |
+| `/health` 不返回版本信息 | 服务跑的是旧代码时探活照样返回 200，测试脚本分辨不出来 | `/health` 带上 commit hash 或启动时间 |
 
 ---
 
 ## 路线图
 
 - [x] 第 10 周：数据模型、迁移、六个 CRUD 接口 + 标签计数
-- [x] 第 11 周：用户注册 / 登录、bcrypt 密码哈希、JWT 鉴权，替换 `get_current_user_id`
+- [x] 第 11 周：用户注册 / 登录、bcrypt 密码哈希、JWT 鉴权，替换 `get_current_user_id`；所有权校验抽成依赖；全局异常处理与统一错误响应
 - [ ] 第 12 周：Dockerfile + docker-compose（MySQL + 应用），注意显式安装 `cryptography`
 - [ ] 第 13 周：Streamlit 前端
 
@@ -363,7 +418,8 @@ Note.tags.any(Tag.name == tag)
   `RuntimeError: Event loop is closed`（aiomysql 连接对象 GC 时触发）。uvicorn 下不会出现。
 - 异步 ORM 必须设 `expire_on_commit=False`，否则 commit 后再读属性会抛 `MissingGreenlet`。
 - `scripts/test_api.py` 的**退出码约定**：`0` = 22 条全过；`1` = 有用例失败，或服务根本没启动。
-  脚本开头先探 `/health`，连不上直接退出（抓 `httpx.TransportError`，它同时覆盖 `ConnectError` 和超时），
+  脚本开头先探 `/health`，分两段判断：`try/except httpx.TransportError` 管传输层（连不上、超时），
+  紧跟 `if r.status_code != 200` 管应用层（连上了但服务状态不对）。只看前者会漏掉"路由丢了但端口还通"的情况。
   所以它可以直接接在 `&&` 链后面或丢进 CI。
 - 验退出码时**别接管道**：`python x.py | tail` 之后 `$?` 取的是 `tail` 的状态，永远是 0。
   要么先 `> log 2>&1` 再 `echo $?`，要么 `set -o pipefail`。
@@ -374,3 +430,12 @@ Note.tags.any(Tag.name == tag)
   一个 `except` 就能全接住；但要额外带上 `KeyError`（无 `sub`）和 `ValueError`（`sub` 不是数字）。
 - 密码上限是 **72 字节**（不是 72 字符）：bcrypt 5.x 对超长输入直接抛 `ValueError`，不是静默截断。
   一个汉字占 3 字节，所以 24 个汉字就已经到顶了——校验必须按 `len(v.encode("utf-8"))` 算。
+- `Exception` 的处理器挂在最外层 `ServerErrorMiddleware` 上，响应发出后**异常会重新抛一遍**
+  （`starlette/middleware/errors.py` 里的 `raise exc`）。所以加了 handler 之后控制台照样打完整 traceback，
+  这不是没生效，而是设计如此：日志归日志，响应归响应。
+  但 `FastAPI(debug=True)` 会让这个处理器**彻底失效**，改用 HTML 调试页并把源码片段暴露给浏览器——别为了看堆栈开它。
+- **`JSONResponse` 不经过 `jsonable_encoder`**。`request_model`/`response_model` 那条路会自动转 `datetime`、
+  异常对象等，`JSONResponse(content=...)` 不会，塞进去就是 `TypeError: Object of type X is not JSON serializable`。
+  所以 422 处理器要主动丢弃 `ctx`（内含 `ValueError` 实例），而不是靠 encoder 兜底。
+- 异常处理器里**不要碰 `db`**：异常可能正发生在事务中间，session 状态未知，再查一次只会套出第二个异常，
+  客户端收到的是 `Exception in ASGI application`，连 500 的 JSON 都没了。
