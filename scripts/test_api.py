@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 import httpx
 
@@ -103,6 +104,87 @@ async def main():
                 created_ids.remove(note_id)
             r = await client.delete(f"/notes/{note_id}")
             check("未找到此id的笔记", r.status_code == 404)
+
+            # ============ 鉴权与参数边界：补覆盖率缺口的部分 ============
+            # 1) 坏 token：形状像 Bearer，但解不开 → 401。
+            #    这一条同时覆盖 dependencies.py 的 user_id is None 和 security.py 的 except
+            r = await client.get("/notes", headers={"Authorization": "Bearer not-a-real-jwt"})
+            check("坏 token 返回 401", r.status_code == 401, f"{r.status_code} {r.text[:80]}")
+            check("坏 token 的 401 带 WWW-Authenticate",
+                  r.headers.get("WWW-Authenticate") == "Bearer",
+                  r.headers.get("WWW-Authenticate"))
+
+            # 2) 用户名对、密码错 → 401（登录失败分支）
+            r = await client.post("/auth/login",
+                                  data={"username": "zz_api_user", "password": "wrong_password_123"})
+            check("密码错误返回 401", r.status_code == 401, f"{r.status_code} {r.text[:80]}")
+
+            # 3) 注册成功路径。固定用户名永远走 409，所以每次用时间戳造一个新的
+            new_user = f"zz_api_reg_{int(time.time())}"
+            r = await client.post("/auth/register",
+                                  json={"username": new_user, "password": "TestPass123"})
+            check("注册新用户返回 201", r.status_code == 201, f"{r.status_code} {r.text[:80]}")
+            r = await client.post("/auth/register",
+                                  json={"username": new_user, "password": "TestPass123"})
+            check("重复注册返回 409", r.status_code == 409, f"{r.status_code} {r.text[:80]}")
+
+            # 4) 25 个中文字 = 75 字节 > 72。Field 的 max_length 数的是字符，拦不住，靠 AfterValidator
+            r = await client.post("/auth/register",
+                                  json={"username": "zz_api_longpwd", "password": "密" * 25})
+            errs = r.json().get("errors", []) if r.status_code == 422 else []
+            check("超 72 字节的密码返回 422 且 field 是 password",
+                  bool(errs) and errs[0].get("field") == "password",
+                  f"{r.status_code} {r.text[:120]}")
+
+            # 5) 非法 JSON：解析阶段就失败，loc 里没有字段名，field 只能是 body
+            r = await client.post("/notes", content=b'{"title":',
+                                  headers={"Content-Type": "application/json"})
+            errs = r.json().get("errors", []) if r.status_code == 422 else []
+            check("非法 JSON 返回 422 且 field 是 body",
+                  bool(errs) and errs[0].get("field") == "body",
+                  f"{r.status_code} {r.text[:120]}")
+
+            # 6) PATCH 带 tags / 清空 tags。PUT /tags 测过了，但 PATCH 里是另一段代码
+            r = await client.post("/notes", json={"title": "zz_patch_tags", "content": "x"})
+            body = r.json()
+            tag_note_id = None
+            check("建一条专门测 PATCH tags 的笔记", r.status_code == 201, f"{r.status_code} {r.text[:80]}")
+            if r.status_code == 201:
+                tag_note_id = body["id"]
+                created_ids.append(tag_note_id)
+            if tag_note_id is not None:
+                r = await client.patch(f"/notes/{tag_note_id}", json={"tags": ["zz_patched"]})
+                body = r.json()
+                check("PATCH 能改标签",
+                      r.status_code == 200 and body.get("tags") == ["zz_patched"],
+                      f"{r.status_code} {body.get('tags')}")
+                r = await client.patch(f"/notes/{tag_note_id}", json={"tags": []})
+                body = r.json()
+                check("PATCH 传空列表能清空标签",
+                      r.status_code == 200 and body.get("tags") == [],
+                      f"{r.status_code} {body.get('tags')}")
+
+            # 7) 从没出现过的标签名 → 走「新建 Tag」分支
+            fresh = f"zz_new_{int(time.time())}"
+            r = await client.post("/notes",
+                                  json={"title": "zz_新标签", "content": "x", "tags": [fresh]})
+            body = r.json()
+            check("POST 全新标签名会自动创建",
+                  r.status_code == 201 and body.get("tags") == [fresh],
+                  f"{r.status_code} {body.get('tags')}")
+            if r.status_code == 201:
+                created_ids.append(body["id"])
+
+            # 8) 上面那个 fresh 标签再传一次，换成大写：清洗阶段就该合并成一个，不会去数据库里查
+            r = await client.post("/notes",
+                                  json={"title": "zz_去重", "content": "x",
+                                        "tags": [fresh, fresh.upper()]})
+            body = r.json()
+            check("同名不同大小写的标签只留一个",
+                  r.status_code == 201 and len(body.get("tags") or []) == 1,
+                  f"{r.status_code} {body.get('tags')}")
+            if r.status_code == 201:
+                created_ids.append(body["id"])
         finally:
             for i in created_ids:
                 try:

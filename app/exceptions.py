@@ -43,7 +43,7 @@ async def http_exception_handler(
 ) -> JSONResponse:
     headers = getattr(exc, "headers", None)
     detail = exc.detail
-    if isinstance(detail, str):                     # detail 也可能是 dict，dict 不能做字典键
+    if isinstance(detail, str):                     # pragma: no branch  # detail 也可能是 dict，本项目从不这么用
         detail = FRAMEWORK_MESSAGES.get(detail, detail)
     return JSONResponse(
         status_code=exc.status_code,
@@ -52,7 +52,7 @@ async def http_exception_handler(
     )
 
 
-async def unhandled_exception_handler(
+async def unhandled_exception_handler(  # pragma: no cover — 没有路由会抛未捕获异常，测不到
         request: Request,
         exc: Exception
 ) -> JSONResponse:

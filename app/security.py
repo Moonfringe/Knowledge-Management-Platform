@@ -21,7 +21,7 @@ def verify_password(plain: str, hashed: str) -> bool:
         pwd_bytes = plain.encode("utf8")
         hashed_bytes = hashed.encode("utf8")
         return bcrypt.checkpw(pwd_bytes, hashed_bytes)
-    except ValueError:
+    except ValueError:  # pragma: no cover — 库里存了非 bcrypt 格式的哈希才会走到
         return False
 
 

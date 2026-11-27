@@ -4,7 +4,7 @@
 
 **FastAPI + SQLAlchemy 2.0（异步）+ MySQL 8 + Alembic**，全异步实现。
 
-> 学习项目，按周迭代。当前进度：第 11 周完成（数据模型 + 全部 CRUD 接口 + 用户注册/登录 + JWT 鉴权 + 统一错误响应）。
+> 学习项目，按周迭代。当前进度：第 11 周完成（数据模型 + 全部 CRUD 接口 + 用户注册/登录 + JWT 鉴权 + 统一错误响应 + 接口测试全覆盖）。
 
 ---
 
@@ -24,6 +24,7 @@
 | bcrypt | 5.0 | 密码哈希，`gensalt(12)` |
 | PyJWT | 2.15 | 签发 / 校验 JWT（包名 `PyJWT`，import 写 `jwt`） |
 | python-multipart | 0.0.34 | `OAuth2PasswordRequestForm` 解析 form 表单必需 |
+| coverage | 7.17 | 覆盖率统计，需 `--concurrency=greenlet`（见「测试与覆盖率」） |
 
 > `cryptography` 不是可选项。MySQL 8 默认认证方式在非 TLS 连接下需要 RSA 加密，缺少它会报
 > `RuntimeError: 'cryptography' package is required for caching_sha2_password auth methods`。
@@ -192,6 +193,74 @@ body 整体不是合法 JSON 时 `field` 为 `"body"`。
 
 ---
 
+## 测试与覆盖率
+
+两个脚本，用 `httpx` 打真实 `uvicorn`。**不能用 `TestClient`**，原因见文末开发备注。
+
+```bash
+# 终端 1：起服务（要统计覆盖率时不要带 --reload）
+.venv\Scripts\python -m uvicorn main:app
+
+# 终端 2
+.venv\Scripts\python scripts/test_api.py     # 34 条：单身份接口行为
+.venv\Scripts\python scripts/test_authz.py   # 15 条：双身份越权
+```
+
+| 脚本 | 主题 | 断言数 | 退出码 |
+|---|---|---|---|
+| `test_api.py` | 一个用户调接口，看返回对不对（含 401 / 422 / 404、参数边界） | 34 | `0` 全过；`1` 有用例失败或服务没起 |
+| `test_authz.py` | **B 持合法 token 打 A 的资源**，应读不到、改不了、删不掉 | 15 | 同上 |
+
+### 越权测试的三个设计点
+
+- **两个 `httpx.AsyncClient` 各持一个 token**，不靠切换 header。这批断言的核心动作是"B 打完 404 之后 A 再查一遍"，一个 client 就得来回改 header，改错一次整批测试假绿，而且假绿得毫无痕迹。
+- **B 自己也建一条笔记和一个标签**。否则 B 的列表本来就空，"看不到 A 的笔记"这条恒真——这就是"空数据让断言恒真"的坑，第 10 周已经踩过一次。
+- **每条 404 后跟一次 A 视角复查**。404 只证明接口返回了 404，不证明数据没被改：请求可能写完半条记录才撞上 404。**断言 404 是断言接口行为，断言数据没变才是断言安全。**
+
+第 4 条（删除）还要额外断言"A 自己删返回 204"这个前提。实测过：当前提不成立时，"A 删掉后 B 再删仍是 404"会**虚假通过**——因为它通过的理由（笔记确实不存在）和它想验证的性质（不是你的就删不掉）毫无关系。
+
+### 断言的可信度靠变异验证
+
+覆盖率不回答"断言能不能守住"，只回答"代码跑过没有"。验证方法是**把实现改坏，看测试红不红**：
+
+| 改动 | 结果 | 说明 |
+|---|---|---|
+| 删掉 `get_owned_note` 的 `or note.user_id != user_id` | 15 条红 **9** 条 | 4 组"B 打 A"的接口各红 2 条（行为 + 数据复查），第 8 条的前提也红 |
+| 把整个 `if` 三行都删掉 | 15 条红 **10** 条 | 多出的一条不是越权：`db.get` 返回 `None` 没有兜底，变成 500 |
+| 不改代码 | 15 条全绿 | |
+
+**红 0 条 = 这批测试没写**。反过来，改坏一次只红一条、或红的理由需要看日志才猜得出来，说明断言的 `detail` 没写实际值。
+
+同一套 15 条在两个变异下失败理由不同（`A 的笔记仍然存在` 一次实际值是 404，一次是 500），所以 `detail` 必须带"期望 X，实际 Y"，不能只写"失败"。
+
+### 覆盖率怎么跑
+
+```bash
+.venv\Scripts\python -m coverage run --branch --concurrency=greenlet --source=app -m uvicorn main:app
+# 另开终端跑完两个脚本，回终端 1 按 Ctrl+C
+.venv\Scripts\python -m coverage report -m
+.venv\Scripts\python -m coverage html      # 生成 htmlcov/index.html，红色行 = 未覆盖
+```
+
+**`--concurrency=greenlet` 不能省。** SQLAlchemy 异步靠 greenlet 切执行栈把同步驱动包成异步，coverage 默认只追线程栈，切过去就不再记录。症状极具迷惑性：**测试全绿，但每个 `await db.xxx()` 之后的代码行都显示未执行**。同一套测试、同一份代码，不加这个参数 81%，加了 90%。
+
+`.coverage` 和 `htmlcov/` 已在 `.gitignore` 里。
+
+当前：**315 条语句 / 34 个分支 / 100%**。
+
+其中有四处 `# pragma` 排除，都是单进程测试造不出来的**防御性分支**，不是死代码：
+
+| 位置 | 标注 | 为什么测不到 |
+|---|---|---|
+| `exceptions.py` 的 `isinstance(detail, str)` | `no branch` | 本项目没有 dict 类型的 `detail`，条件永不为假 |
+| `exceptions.py` 的 500 兜底 handler | `no cover` | 没有路由会抛未捕获异常 |
+| `security.py` 的 `except ValueError` | `no cover` | 库里存了非 bcrypt 格式的哈希才会走 |
+| `routers/auth.py` 的 `except IntegrityError` | `no cover` | 要两个注册请求撞在同一毫秒（只能用并发赌时序，且赌不中时测试照样通过） |
+
+为凑覆盖率给生产代码加"专用触发路由"是反向的，标注才是正确做法。
+
+---
+
 ## 数据模型
 
 四张表，`users 1:N notes`、`users 1:N tags`、`notes M:N tags`（经 `note_tags`）。
@@ -236,7 +305,8 @@ Knowledge_Management/
 │       ├── notes.py
 │       └── tags.py
 ├── scripts/
-│   └── test_api.py          # httpx 接口自测（22 条断言，需先启动服务）
+│   ├── test_api.py          # 单身份接口自测，34 条断言（需先启动服务）
+│   └── test_authz.py        # 双身份越权测试，15 条断言
 └── .env                     # 不提交
 ```
 
@@ -380,6 +450,14 @@ Note.tags.any(Tag.name == tag)
 `"Not authenticated"` 要单独列一条：它是 `OAuth2PasswordBearer` 在 `auto_error=True` 时抛的，
 不是状态码 401 对应的标准 phrase（那个是 `"Unauthorized"`）。
 
+### 16. 依赖函数一律抛 `HTTPException`，不返回 `None`
+
+`get_owned_note` 找不到笔记、或笔记不属于当前用户时，直接 `raise HTTPException(404)`，**没有"返回 `None` 让调用方判断"这条路**。
+
+若改成 `return None`，FastAPI 会拿 `None` 去填 `response_model=NoteDetail`，抛 `ResponseValidationError`，再被兜底 handler 接住变成 **500**——本该是 404 的错误降级成"服务器内部错误"，客户端还会重试。
+
+这不是假想：变异实验里把所有权判断整段删掉后，`GET /notes/{不存在的 id}` 确实返回了 500。所以依赖函数的出口只有两种：**返回实体，或抛 `HTTPException`**。
+
 ---
 
 ## 已知局限
@@ -390,9 +468,10 @@ Note.tags.any(Tag.name == tag)
 | `OFFSET` 深分页越翻越慢 | 第 1000 页需扫描前 2 万行 | 换游标分页（`WHERE id < 上一页最后一条 id`） |
 | `DATETIME` 精度为秒 | 同一秒内更新的笔记排序不稳定 | 排序加 `id DESC` 兜底；或字段改 `DATETIME(6)` |
 | 孤儿标签不回收 | 清空标签后 `tags` 表留下零引用记录 | 由 `GET /tags` 暴露 + 定期清理任务 |
-| 测试脚本留下固定残留 | `scripts/test_api.py` 每次跑完，`zz_api_user` 账号连同名下 `zz_test` / `FastAPI` 两条零引用标签常驻 `users` / `tags` 表 | 脚本按名字 `get_or_create` 复用已有标签，**ID 不会持续增长**（固定为 27 / 28）；彻底清理需业务层标签回收，不值得为测试数据加 |
-| 测试脚本不是 pytest | 22 条断言靠 `print` 输出，无 fixture、参数化、用例隔离 | 第 12 周后视需要迁移到 pytest |
-| 跨用户越权没有回归断言 | 脚本只用单一账号跑 happy path，隔离逻辑改坏了照样 22/22（已实测验证过这一点） | 补第二个账号，断言详情/改/删/换标签全 404，列表与搜索结果为空 |
+| 测试脚本每次跑都留下新数据 | `test_api.py` 每跑一次，多一个 `zz_api_reg_<时间戳>` 用户和一个 `zz_new_<时间戳>` 孤儿标签；笔记本身能删干净 | 注册成功路径**必须**用全新用户名，固定名永远走 409、测不到；标签同理。彻底解决要先有 `DELETE /tags`，再由脚本自清 |
+| 测试脚本不是 pytest | 49 条断言靠 `print` 输出，无 fixture、无参数化、用例共享同一个数据库 | 需要"3 个用户 × 5 个接口"这类组合时再迁移，`@pytest.mark.parametrize` 能把 15 条压成 5 行 |
+| 测试账号与密码硬编码在脚本里 | 换环境或改密码就得改代码；密码明文进仓库 | 学习项目可接受；正经项目应走环境变量或 fixture |
+| 覆盖率 100% 含 4 处 `pragma` 排除 | "测不到的分支"实际有 4 条，只有读代码或读「测试与覆盖率」才知道 | 并发注册那条可用 `asyncio.gather` 试着撞一次，但赌不中时测试照样通过，收益低 |
 | token 签发后无法主动失效 | 退出登录或改密码后，旧 token 在 60 分钟内仍有效 | 加黑名单（存 Redis）或短期 access + refresh token 双 token |
 | 500 的响应体是固定文案 | 客户端看到的信息量为零，定位问题只能翻服务端日志 | 需要时在响应里带 `trace_id`，与日志关联 |
 | `/health` 不返回版本信息 | 服务跑的是旧代码时探活照样返回 200，测试脚本分辨不出来 | `/health` 带上 commit hash 或启动时间 |
@@ -417,10 +496,10 @@ Note.tags.any(Tag.name == tag)
 - 一次性脚本结尾要 `await engine.dispose()`，否则 Windows 上会刷
   `RuntimeError: Event loop is closed`（aiomysql 连接对象 GC 时触发）。uvicorn 下不会出现。
 - 异步 ORM 必须设 `expire_on_commit=False`，否则 commit 后再读属性会抛 `MissingGreenlet`。
-- `scripts/test_api.py` 的**退出码约定**：`0` = 22 条全过；`1` = 有用例失败，或服务根本没启动。
+- `scripts/test_api.py` 的**退出码约定**：`0` = 34 条全过；`1` = 有用例失败，或服务根本没启动。
+  `scripts/test_authz.py` 是同一套约定（15 条）。两者都可以直接接在 `&&` 链后面或丢进 CI。
   脚本开头先探 `/health`，分两段判断：`try/except httpx.TransportError` 管传输层（连不上、超时），
   紧跟 `if r.status_code != 200` 管应用层（连上了但服务状态不对）。只看前者会漏掉"路由丢了但端口还通"的情况。
-  所以它可以直接接在 `&&` 链后面或丢进 CI。
 - 验退出码时**别接管道**：`python x.py | tail` 之后 `$?` 取的是 `tail` 的状态，永远是 0。
   要么先 `> log 2>&1` 再 `echo $?`，要么 `set -o pipefail`。
 - **PyJWT 2.x 校验 `sub` 必须是字符串**：`jwt.encode({"sub": 1})` 能编码成功，但 `decode` 时会抛
@@ -439,3 +518,13 @@ Note.tags.any(Tag.name == tag)
   所以 422 处理器要主动丢弃 `ctx`（内含 `ValueError` 实例），而不是靠 encoder 兜底。
 - 异常处理器里**不要碰 `db`**：异常可能正发生在事务中间，session 状态未知，再查一次只会套出第二个异常，
   客户端收到的是 `Exception in ASGI application`，连 500 的 JSON 都没了。
+- **coverage 必须加 `--concurrency=greenlet`**：SQLAlchemy 异步的 `await` 走 greenlet 切栈，
+  默认的线程栈追踪会在切过去之后断掉，表现为「每个 `await db.xxx()` 之后的代码行都未覆盖」。
+  同一套测试：81% vs 90%。这条不是配置洁癖，是数字真假的区别。
+- coverage 数据只在进程**正常退出**时落盘：`Ctrl+C` 可以，`taskkill`、关窗口、`CTRL_BREAK_EVENT` 都不行，
+  数据文件会是空的或旧的，你会对着上上次的报告下结论。
+- 想给"单次请求"换个 header（例如测坏 token），直接传 `headers=` 就行：`httpx` 会把它**合并**到 client 的
+  header 上并按 key 覆盖，不用改完再改回来。改回去的写法一旦漏改一行，后面的断言全部 401，
+  而你会以为是代码坏了——这类"污染式前置"正是假绿的常见来源。
+- 覆盖率跑之前先确认 8000 端口没有旧进程：`netstat -ano | findstr :8000`。端口被占时新服务起不来，
+  或者更糟——起来了但你打的是旧进程，报告里全显示未覆盖。

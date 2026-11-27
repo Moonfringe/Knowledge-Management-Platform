@@ -32,7 +32,7 @@ async def register(
     db.add(user)
     try:
         await db.commit()
-    except IntegrityError:
+    except IntegrityError:  # pragma: no cover — 两个并发注册撞在同一毫秒才会走到
         await db.rollback()
         raise HTTPException(status_code=409, detail="用户名已存在")
     return user
