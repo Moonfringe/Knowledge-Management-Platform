@@ -67,6 +67,27 @@ async def main():
             r = await client.get("/notes", params={"tag": "zz_test"})
             body = r.json()
             check("total>=1", body["total"] >= 1)
+
+            # 分页：不假设库里有几条，用 total 反推期望值。
+            # total 必须从不带过滤的请求里取——上面那个 body 是 tag=zz_test 过滤后的
+            total = (await client.get("/notes", params={"size": 1})).json()["total"]
+            # 不足 3 条就补够：否则第 2 页天然是空的，"两页不重叠"会恒真
+            for i in range(max(0, 3 - total)):
+                r = await client.post("/notes", json={"title": f"zz_page_{i}", "content": "x"})
+                if r.status_code == 201:
+                    created_ids.append(r.json()["id"])
+            total = (await client.get("/notes", params={"size": 1})).json()["total"]
+
+            p1 = (await client.get("/notes", params={"page": 1, "size": 2})).json()
+            p2 = (await client.get("/notes", params={"page": 2, "size": 2})).json()
+            ids1 = [i["id"] for i in p1["items"]]
+            ids2 = [i["id"] for i in p2["items"]]
+            check("第 1 页条数正确", len(ids1) == min(2, total),
+                  f"期望 {min(2, total)}，实际 {len(ids1)}（total={total}）")
+            check("两页不重叠", not (set(ids1) & set(ids2)), f"{ids1} vs {ids2}")
+            check("两页并集条数正确", len(set(ids1) | set(ids2)) == min(4, total),
+                  f"期望 {min(4, total)}，实际 {sorted(set(ids1) | set(ids2))}")
+
             r = await client.get(f"/notes/{note_id}")
             body = r.json()
             check("详情返回 200 且含 content", r.status_code == 200 and "content" in body, r.text[:100])
@@ -143,6 +164,17 @@ async def main():
             check("非法 JSON 返回 422 且 field 是 body",
                   bool(errs) and errs[0].get("field") == "body",
                   f"{r.status_code} {r.text[:120]}")
+
+            # 5b) Query 参数越界：同一套 422 校验，但 loc 里是 query 而不是 body。
+            #     三条只有参数值不同，写循环；分开写会让人以为它们各测一件事
+            for params, name in (({"page": 0}, "page=0"),
+                                 ({"size": 0}, "size=0"),
+                                 ({"size": 101}, "size=101")):
+                r = await client.get("/notes", params=params)
+                errs = r.json().get("errors", []) if r.status_code == 422 else []
+                check(f"{name} 返回 422 且 field 正确",
+                      bool(errs) and errs[0].get("field") == list(params)[0],
+                      f"{r.status_code} {r.text[:120]}")
 
             # 6) PATCH 带 tags / 清空 tags。PUT /tags 测过了，但 PATCH 里是另一段代码
             r = await client.post("/notes", json={"title": "zz_patch_tags", "content": "x"})
