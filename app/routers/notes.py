@@ -62,7 +62,9 @@ async def get_notes(
     total = await db.scalar(select(func.count()).select_from(Note).where(*conditions))
     items = await db.scalars(
         select(Note).where(*conditions)
-        .order_by(Note.is_pinned.desc(), Note.updated_at.desc())
+        # id.desc() 是兜底：updated_at 精度只到秒，同一秒内多条记录的顺序由数据库决定，
+        # 而 OFFSET 分页要求排序完全确定，否则翻页会重复或漏掉记录
+        .order_by(Note.is_pinned.desc(), Note.updated_at.desc(), Note.id.desc())
         .offset((page - 1) * size)
         .limit(size)
     )

@@ -159,7 +159,8 @@ curl -s --noproxy "*" http://127.0.0.1:8000/notes -H "Authorization: Bearer $TOK
 }
 ```
 
-排序固定为 `is_pinned DESC, updated_at DESC`。列表项不含 `content`，详情才返回全文。
+排序固定为 `is_pinned DESC, updated_at DESC, id DESC`。最后的 `id DESC` 是兜底，原因见设计决策 17。
+列表项不含 `content`，详情才返回全文。
 
 ### `GET /tags` 响应
 
@@ -458,6 +459,16 @@ Note.tags.any(Tag.name == tag)
 
 这不是假想：变异实验里把所有权判断整段删掉后，`GET /notes/{不存在的 id}` 确实返回了 500。所以依赖函数的出口只有两种：**返回实体，或抛 `HTTPException`**。
 
+### 17. 列表排序必须带 `id` 兜底
+
+`GET /notes` 的排序是 `is_pinned DESC, updated_at DESC, id DESC`，最后一个 `id DESC` 不是可选的。
+
+`DATETIME` 精度只到**秒**，同一秒内创建或更新的多条笔记，`updated_at` 完全相同。此时 SQL 只规定了"按 updated_at 降序"，没规定相同值之间谁先谁后——**数据库可以每次返回不同顺序**。配上 `LIMIT / OFFSET` 就是具体故障：第 1 页出现过的笔记又出现在第 2 页，另一些则一次都不出现。
+
+加 `id DESC` 让排序变成**全序**，顺序不再由执行计划决定。
+
+值得记一笔的是**这种缺陷测不出来**：MySQL 上"未定义顺序"往往恰好等于主键顺序，你写不出一条能稳定复现的红。所以它只能靠"加约束"消除，不能靠"加断言"验证——`test_api.py` 里的分页断言只能证明"现在不重叠"，证明不了"当初为什么会重叠"。
+
 ---
 
 ## 已知局限
@@ -466,7 +477,6 @@ Note.tags.any(Tag.name == tag)
 |---|---|---|
 | `LIKE '%kw%'` 前缀通配，索引失效 | 数据量大后搜索全表扫描 | 引入全文索引 / 搜索引擎 |
 | `OFFSET` 深分页越翻越慢 | 第 1000 页需扫描前 2 万行 | 换游标分页（`WHERE id < 上一页最后一条 id`） |
-| `DATETIME` 精度为秒 | 同一秒内更新的笔记排序不稳定 | 排序加 `id DESC` 兜底；或字段改 `DATETIME(6)` |
 | 孤儿标签不回收 | 清空标签后 `tags` 表留下零引用记录 | 由 `GET /tags` 暴露 + 定期清理任务 |
 | 测试脚本每次跑都留下新数据 | `test_api.py` 每跑一次，多一个 `zz_api_reg_<时间戳>` 用户和一个 `zz_new_<时间戳>` 孤儿标签；笔记本身能删干净 | 注册成功路径**必须**用全新用户名，固定名永远走 409、测不到；标签同理。彻底解决要先有 `DELETE /tags`，再由脚本自清 |
 | 测试脚本不是 pytest | 49 条断言靠 `print` 输出，无 fixture、无参数化、用例共享同一个数据库 | 需要"3 个用户 × 5 个接口"这类组合时再迁移，`@pytest.mark.parametrize` 能把 15 条压成 5 行 |
