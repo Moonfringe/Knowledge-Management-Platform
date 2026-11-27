@@ -5,3 +5,7 @@ __pycache__/
 
 # 本地学习笔记（ORM↔SQL 对照 PDF），不随仓库分发
 docs/
+
+# 测试覆盖率产物
+.coverage
+htmlcov/
